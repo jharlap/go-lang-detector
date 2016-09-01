@@ -3,19 +3,20 @@ package langdet
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"sort"
 )
 
 // the depth of n-gram tokens that are created. if nDepth=1, only 1-letter tokens are created
-const nDepth = 4
+const defaultNDepth = 4
 
-// defaultMinimumConfidence is the minimum confidence that a language-match must have to be returned as detected language
-var defaultMinimumConfidence float32 = 0.7
+// DefaultMinimumConfidence is the minimum confidence that a language-match must have to be returned as detected language
+var DefaultMinimumConfidence float32 = 0.7
 
 var defaultLanguages = []Language{}
 
-var DefaultDetector = Detector{&defaultLanguages, defaultMinimumConfidence}
+var DefaultDetector = Detector{&defaultLanguages, DefaultMinimumConfidence, defaultNDepth}
 
 func init() {
 	analyzedInput, err := ioutil.ReadFile("default_languages.json")
@@ -35,11 +36,25 @@ func init() {
 func InitWithDefault(filePath string) {
 	analyzedInput, err := ioutil.ReadFile(filePath)
 	if err != nil {
-		panic(fmt.Sprintf("Could not open file of default languages: %v", err))
+		panic(fmt.Sprintf("Could not open languages file: %v", err))
 	}
-	err = json.Unmarshal(analyzedInput, &defaultLanguages)
+	parseExistingLanguageMap(&analyzedInput, &defaultLanguages)
+}
+
+// InitWithDefault initializes the default languages with a provided Reader
+// containing Marshalled array of Languages
+func InitWithDefaultFromReader(reader io.Reader) {
+	analyzedInput, err := ioutil.ReadAll(reader)
 	if err != nil {
-		panic(fmt.Sprintf("Could not unmarshall default languages: %v", err))
+		panic(fmt.Sprintf("Could not process languages io.Reader: %v", err))
+	}
+	parseExistingLanguageMap(&analyzedInput, &defaultLanguages)
+}
+
+func parseExistingLanguageMap(bytes *[]byte, targetLanguages *[]Language) {
+	err := json.Unmarshal(*bytes, targetLanguages)
+	if err != nil {
+		panic(fmt.Sprintf("Could not unmarshall languages: %v", err))
 	}
 }
 
@@ -47,12 +62,13 @@ func InitWithDefault(filePath string) {
 type Detector struct {
 	Languages         *[]Language
 	MinimumConfidence float32
+	NDepth            int
 }
 
 // NewDetector returns a new Detector without any language.
 // It can be used to add languages selectively.
 func NewDetector() Detector {
-	return Detector{&[]Language{}, defaultMinimumConfidence}
+	return Detector{&[]Language{}, DefaultMinimumConfidence, defaultNDepth}
 }
 
 // NewDetectorDefault returns a new Detector with the default languages, if loaded:
@@ -60,7 +76,18 @@ func NewDetector() Detector {
 func NewDefaultLanguages() Detector {
 	defaultCopy := make([]Language, len(defaultLanguages))
 	copy(defaultCopy, defaultLanguages)
-	return Detector{&defaultCopy, defaultMinimumConfidence}
+	return Detector{&defaultCopy, DefaultMinimumConfidence, defaultNDepth}
+}
+
+// NewWithLanguagesFromReader returns a new Detector with existing language parsed from a reader
+func NewWithLanguagesFromReader(reader io.Reader) Detector {
+	languages := []Language{}
+	analyzedInput, err := ioutil.ReadAll(reader)
+	if err != nil {
+		panic(fmt.Sprintf("Could not unmarshall languages: %v", err))
+	}
+	parseExistingLanguageMap(&analyzedInput, &languages)
+	return Detector{&languages, DefaultMinimumConfidence, defaultNDepth}
 }
 
 // Add language analyzes a text and creates a new Language with given name.
@@ -70,7 +97,10 @@ func (d *Detector) AddLanguageFromText(textToAnalyze, languageName string) {
 		newSlice := make([]Language, 0, 0)
 		d.Languages = &newSlice
 	}
-	analyzedLanguage := Analyze(textToAnalyze, languageName)
+	if d.NDepth == 0 {
+		d.NDepth = defaultNDepth
+	}
+	analyzedLanguage := Analyze(textToAnalyze, languageName, d.NDepth)
 	updatedList := append(*d.Languages, analyzedLanguage)
 	*d.Languages = updatedList
 }
@@ -92,14 +122,17 @@ func (d *Detector) AddLanguage(languages ...Language) {
 // It returns undefined otherwise. Set detector's MinimumConfidence for customization.
 func (d *Detector) GetClosestLanguage(text string) string {
 	if d.MinimumConfidence <= 0 || d.MinimumConfidence > 1 {
-		d.MinimumConfidence = defaultMinimumConfidence
+		d.MinimumConfidence = DefaultMinimumConfidence
 	}
 	if len(*d.Languages) == 0 {
 		fmt.Println("no languages configured for this detector")
 		return "undefined"
 	}
-	occ := createOccurenceMap(text, nDepth)
-	lmap := createRankLookupMap(occ)
+	if d.NDepth == 0 {
+		d.NDepth = defaultNDepth
+	}
+	occ := CreateOccurenceMap(text, d.NDepth)
+	lmap := CreateRankLookupMap(occ)
 	c := d.closestFromTable(lmap)
 
 	if len(c) == 0 || c[0].Confidence < asPercent(d.MinimumConfidence) {
@@ -110,8 +143,11 @@ func (d *Detector) GetClosestLanguage(text string) string {
 
 // GetLanguages analyzes a text and returns the DetectionResult of all languages of this detector.
 func (d *Detector) GetLanguages(text string) []DetectionResult {
-	occ := createOccurenceMap(text, nDepth)
-	lmap := createRankLookupMap(occ)
+	if d.NDepth == 0 {
+		d.NDepth = defaultNDepth
+	}
+	occ := CreateOccurenceMap(text, d.NDepth)
+	lmap := CreateRankLookupMap(occ)
 	results := d.closestFromTable(lmap)
 	return results
 }
@@ -127,7 +163,7 @@ func (d *Detector) closestFromTable(lookupMap map[string]int) []DetectionResult 
 	for _, language := range *d.Languages {
 		lSize := len(language.Profile)
 		maxPossibleDistance := lSize * inputSize
-		dist := getDistance(lookupMap, language.Profile, lSize)
+		dist := GetDistance(lookupMap, language.Profile, lSize)
 		relativeDistance := 1 - float64(dist)/float64(maxPossibleDistance)
 		confidence := int(relativeDistance * 100)
 		res = append(res, DetectionResult{Name: language.Name, Confidence: confidence})
@@ -139,7 +175,7 @@ func (d *Detector) closestFromTable(lookupMap map[string]int) []DetectionResult 
 
 // getDistance calculates the out-of-place distance between two Profiles,
 // taking into account only items of mapA, that have a value bigger then 300
-func getDistance(mapA, mapB map[string]int, maxDist int) int {
+func GetDistance(mapA, mapB map[string]int, maxDist int) int {
 	var result int
 	negMaxDist := ((-1) * maxDist)
 	for key, rankA := range mapA {
